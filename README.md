@@ -14,6 +14,48 @@ I also implemented the transactional email with the outbox pattern. The notifica
 
 Finally, I configured the pipeline that builds the Docker image and deploys it to the staging server on each push to the `develop` branch. I also set up the observability stack with Prometheus, Loki and Grafana, which collects metrics and logs from the API.
 
+## Architecture
+
+The diagram shows the main domains of the API, how they communicate through the Event Dispatcher and which database each one uses.
+
+```mermaid
+flowchart TB
+    clients["Web and mobile clients"]
+
+    subgraph api["FastAPI application"]
+        auth["auth"]
+        chatbot["chatbot"]
+        ticket["ticket"]
+        live_chat["live_chat"]
+        notifications["notifications"]
+        dispatcher{{"Event Dispatcher"}}
+        worker["Email outbox worker"]
+    end
+
+    pg[("PostgreSQL")]
+    mongo[("MongoDB")]
+    email["Email provider"]
+    obs["Prometheus, Loki and Grafana"]
+
+    clients -->|"HTTP and WebSocket"| api
+
+    auth --> dispatcher
+    chatbot <--> dispatcher
+    ticket <--> dispatcher
+    dispatcher --> live_chat
+    dispatcher --> notifications
+
+    auth --> pg
+    notifications --> pg
+    worker --> pg
+    worker --> email
+    chatbot --> mongo
+    ticket --> mongo
+    live_chat --> mongo
+
+    api -->|"metrics and logs"| obs
+```
+
 ## Tech Stack
 
 | Layer        | Technology                            |
