@@ -2,6 +2,18 @@
 
 Backend and API Gateway built with **FastAPI**, **SQLAlchemy 2** (async), **PostgreSQL**, and **MongoDB (Motor)**.
 
+## Contributions
+
+This repository is a fork of [Titus-System/syncdesk-api](https://github.com/Titus-System/syncdesk-api), the backend of SyncDesk, a web and mobile help desk built by a team of six people for a FATEC course. I was the main author of the backend, with 177 of the 238 commits on the original `main` branch. The [commits authored by pedro-fs-garcia](https://github.com/Titus-System/syncdesk-api/commits/main/?author=pedro-fs-garcia) are listed in the original repository.
+
+I took part in defining the architecture, which divides the code into domains such as auth, live chat, ticket, chatbot and notifications. In addition, I created the initial project base with the API gateway, the configuration, the database layer and the metrics layer. Since the domains needed to react to each other without importing each other's services, I designed the Event Dispatcher, an asynchronous in-process event bus. As a result, a domain publishes a typed event and the domains interested in it subscribe to that event, so none of them depends on the publisher.
+
+I implemented the real-time chat on WebSockets. The connection requires authentication and a permission check, and the conversations are persisted in MongoDB.
+
+I also implemented the transactional email with the outbox pattern. The notifications domain saves each email in PostgreSQL before sending it, so a crash of the process does not lose pending emails. A background worker then sends the emails, retries failures with exponential backoff and marks an email as dead after its attempt limit.
+
+Finally, I configured the pipeline that builds the Docker image and deploys it to the staging server on each push to the `develop` branch. I also set up the observability stack with Prometheus, Loki and Grafana, which collects metrics and logs from the API.
+
 ## Tech Stack
 
 | Layer        | Technology                            |
