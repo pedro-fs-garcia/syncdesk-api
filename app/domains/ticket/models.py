@@ -20,10 +20,18 @@ class TicketCriticality(Enum):
 
 class TicketStatus(Enum):
     OPEN = "open"
+    AWAITING_ASSIGNMENT = "awaiting_assignment"
     IN_PROGRESS = "in_progress"
     WAITING_FOR_PROVIDER = "waiting_for_provider"
     WAITING_FOR_VALIDATION = "waiting_for_validation"
     FINISHED = "finished"
+    CANCELLED = "cancelled"
+
+
+class TicketLevel(Enum):
+    N1 = "N1"
+    N2 = "N2"
+    N3 = "N3"
 
 
 class TicketComment(BaseModel):
@@ -51,8 +59,8 @@ class TicketHistory(BaseModel):
     name: str
     level: str
     assignment_date: datetime
-    exit_date: datetime
-    transfer_reason: str
+    exit_date: datetime | None = None
+    transfer_reason: str | None = None
 
 
 class Ticket(Document):
@@ -61,12 +69,15 @@ class Ticket(Document):
     criticality: TicketCriticality
     product: str
     status: TicketStatus
+    level: TicketLevel = TicketLevel.N1
     creation_date: datetime
     description: str
-    chat_ids: list[PydanticObjectId]
-    agent_history: list[TicketHistory]
+    chat_ids: list[PydanticObjectId] = Field(default_factory=list)
+    agent_history: list[TicketHistory] = Field(default_factory=list)
     client: TicketClient
-    comments: list[TicketComment]
+    comments: list[TicketComment] = Field(default_factory=list)
+    closed_at: datetime | None = None
+    closed_by_agent: TicketHistory | None = None
 
     class Settings:
         name = "tickets"

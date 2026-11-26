@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
@@ -24,6 +25,7 @@ class IncomingMessage(BaseModel):
     content: str
     mime_type: str | None = None
     filename: str | None = None
+    file_id: UUID | None = None
     responding_to: UUID | None = None
 
     @model_validator(mode="before")
@@ -35,13 +37,20 @@ class IncomingMessage(BaseModel):
 
     @model_validator(mode="after")
     def validate_logic(self) -> "IncomingMessage":
-        if self.type == "text" and (self.filename is not None or self.mime_type is not None):
+        if self.type == "text" and (
+            self.filename is not None or self.mime_type is not None or self.file_id is not None
+        ):
             raise ValueError(
-                "Invalid payload. mime_type and filename fields are not allowed for text messages."
+                "Invalid payload. mime_type, filename and file_id are not allowed "
+                "for text messages."
             )
 
-        if self.type == "file" and (self.mime_type is None or self.filename is None):
-            raise ValueError("mime_type and filename fields are required when type='file'")
+        if self.type == "file" and (
+            self.mime_type is None or self.filename is None or self.file_id is None
+        ):
+            raise ValueError(
+                "mime_type, filename and file_id are required when type='file'"
+            )
 
         return self
 
@@ -59,3 +68,27 @@ class PaginatedMessages(BaseModel):
     page: int
     limit: int
     has_next: bool
+
+
+class ActiveConversationSummary(BaseModel):
+    chat_id: PydanticObjectId
+    ticket_id: PydanticObjectId
+    client_id: UUID
+    client_name: str
+    client_email: str | None = None
+    agent_id: UUID | None = None
+    started_at: datetime
+    finished_at: datetime | None = None
+    last_message: str | None = None
+    last_message_at: datetime | None = None
+    message_count: int = 0
+    can_join_live: bool = False
+    needs_assume: bool = False
+    triage_id: str | None = None
+    product: str | None = None
+    description: str | None = None
+    notes: list[str] = []
+    ticket_status: str | None = None
+    assigned_agent_id: UUID | None = None
+    assigned_agent_name: str | None = None
+    created_at: datetime | None = None

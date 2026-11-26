@@ -1,14 +1,14 @@
 name: Deploy Staging
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "develop" ]
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/syncdesk-api
+  IMAGE_NAME: titus-system/syncdesk-api
 
 jobs:
-  build-and-deploy:
+  build-and-push:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -29,19 +29,34 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: deploy/Dockerfile
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging
 
-      - name: Copy Compose to Droplet
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Copy compose files to Droplet
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.DROPLET_HOST }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "docker-compose.yaml,docker-compose.staging.yml"
-          target: "/opt/syncdesk/"
+          target: /opt/syncdesk
+          source: docker-compose.yaml,deploy/docker-compose.staging.yaml,deploy/prometheus,deploy/alertmanager,deploy/loki,deploy/promtail,deploy/grafana
+          debug: true
+          timeout: 15s
+          command_timeout: 2m
 
-      - name: Deploy Stack
+      - name: Deploy to Droplet
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DROPLET_HOST }}
@@ -49,5 +64,5 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             cd /opt/syncdesk
-            docker compose -f docker-compose.yaml -f docker-compose.staging.yml pull api
-            docker compose -f docker-compose.yaml -f docker-compose.staging.yml up -d --remove-orphans
+            docker compose -f docker-compose.yaml -f deploy/docker-compose.staging.yaml pull api
+            docker compose -f docker-compose.yaml -f deploy/docker-compose.staging.yaml up -d --force-recreate

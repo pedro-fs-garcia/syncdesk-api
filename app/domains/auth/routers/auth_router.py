@@ -4,8 +4,9 @@ from fastapi.responses import JSONResponse
 from app.core.dependencies import ResponseFactoryDep
 from app.core.exceptions import AppHTTPException
 from app.core.logger import get_logger
-from app.db.exceptions import ResourceAlreadyExistsError
+from app.db.exceptions import ResourceAlreadyExistsError, ResourceNotFoundError
 from app.domains.auth.schemas.api_schemas import (
+    AcceptTermsRequest,
     AdminRegisterUserRequest,
     ChangePasswordRequest,
     ForgotPasswordRequest,
@@ -80,6 +81,10 @@ async def register_common_user(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid registration data",
         ) from e
+    except ResourceNotFoundError as e:
+        raise AppHTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except ValueError as e:
+        raise AppHTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
 
 @auth_router.post("/refresh", tags=["Auth"], **refresh_swagger)
@@ -159,6 +164,10 @@ async def admin_register_user(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid registration data",
         ) from e
+    except ResourceNotFoundError as e:
+        raise AppHTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e)) from e
+    except ValueError as e:
+        raise AppHTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
 
 @auth_router.post(
@@ -194,7 +203,7 @@ async def forgot_password(
     try:
         await service.forgot_password(dto.email)
     except Exception:
-        get_logger().error("Failed forgot-password pipeline.", exc_info=True)
+        get_logger("app.auth.router").exception("Failed forgot-password pipeline.")
     return response.success(
         data={"message": "If the email exists, a reset link has been sent."},
         status_code=status.HTTP_200_OK,
@@ -219,3 +228,24 @@ async def reset_password(
         raise AppHTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset token."
         ) from e
+
+@auth_router.post("/accept-terms", tags=["Auth"])
+async def accept_terms(
+    dto: AcceptTermsRequest,
+    user_session: CurrentUserSessionDep,
+    service: UserServiceDep,
+    response: ResponseFactoryDep,
+) -> JSONResponse:
+    if not dto.accepted:
+        raise AppHTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Terms must be accepted.",
+        )
+
+    user = user_session[0]
+    updated_user = await service.accept_terms(user.id)
+
+    if updated_user is None:
+        raise AppHTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    return response.success(data=updated_user.to_response_dict(), status_code=status.HTTP_200_OK)

@@ -9,7 +9,11 @@ from app.core.dependencies import (
     PasswordSecurityDep,
     ResetTokenSecurityDep,
 )
+from app.core.event_dispatcher import EventDispatcherDep
 from app.core.exceptions import AppHTTPException
+from app.core.logger import get_logger, user_id_ctx
+
+_ws_auth_logger = get_logger("app.auth.ws")
 from app.db.postgres.dependencies import PgSessionDep
 from app.domains.auth.repositories.password_reset_token_repository import (
     PasswordResetTokenRepository,
@@ -27,19 +31,18 @@ from .exceptions import (
 from .repositories.permission_repository import PermissionRepository
 from .repositories.role_repository import RoleRepository
 from .repositories.session_repository import SessionRepository
+from .repositories.user_level_repository import UserLevelRepository
 from .repositories.user_repository import UserRepository
 from .services.auth_service import AuthService
 from .services.permission_service import PermissionService
 from .services.role_service import RoleService
 from .services.session_service import SessionService
+from .services.user_level_service import UserLevelService
 from .services.user_service import UserService
 
 bearer_scheme = HTTPBearer()
 
 
-# ============================================================
-# Repositories
-# ============================================================
 def get_role_repository(db: PgSessionDep) -> RoleRepository:
     return RoleRepository(db)
 
@@ -52,6 +55,10 @@ def get_user_repository(db: PgSessionDep) -> UserRepository:
     return UserRepository(db)
 
 
+def get_user_level_repository(db: PgSessionDep) -> UserLevelRepository:
+    return UserLevelRepository(db)
+
+
 def get_session_repository(db: PgSessionDep) -> SessionRepository:
     return SessionRepository(db)
 
@@ -60,9 +67,6 @@ def get_password_reset_token_repository(db: PgSessionDep) -> PasswordResetTokenR
     return PasswordResetTokenRepository(db)
 
 
-# ============================================================
-# Services
-# ============================================================
 def get_role_service(
     role_repo: Annotated[RoleRepository, Depends(get_role_repository)],
 ) -> RoleService:
@@ -77,8 +81,26 @@ def get_permission_service(
 
 def get_user_service(
     user_repo: Annotated[UserRepository, Depends(get_user_repository)],
+    token_repo: Annotated[
+        PasswordResetTokenRepository, Depends(get_password_reset_token_repository)
+    ],
+    reset_token_security: ResetTokenSecurityDep,
+    password_security: PasswordSecurityDep,
+    dispatcher: EventDispatcherDep,
 ) -> UserService:
-    return UserService(user_repo)
+    return UserService(
+        repo=user_repo,
+        dispatcher=dispatcher,
+        token_repo=token_repo,
+        reset_token_security=reset_token_security,
+        password_security=password_security,
+    )
+
+
+def get_user_level_service(
+    user_level_repo: Annotated[UserLevelRepository, Depends(get_user_level_repository)],
+) -> UserLevelService:
+    return UserLevelService(user_level_repo)
 
 
 def get_session_service(
@@ -97,6 +119,7 @@ def get_password_service(
     password_security: PasswordSecurityDep,
     email_strategy: EmailServiceDep,
     reset_token_security: ResetTokenSecurityDep,
+    dispatcher: EventDispatcherDep,
 ) -> PasswordService:
     return PasswordService(
         user_service=user_service,
@@ -104,6 +127,7 @@ def get_password_service(
         password_security=password_security,
         email_strategy=email_strategy,
         reset_token_security=reset_token_security,
+        dispatcher=dispatcher,
     )
 
 
@@ -114,6 +138,7 @@ def get_auth_service(
     jwt_service: JWTServiceDep,
     password_security: PasswordSecurityDep,
     password_service: Annotated[PasswordService, Depends(get_password_service)],
+    dispatcher: EventDispatcherDep,
 ) -> AuthService:
     return AuthService(
         user_service=user_service,
@@ -122,6 +147,7 @@ def get_auth_service(
         password_security=password_security,
         role_service=role_service,
         password_service=password_service,
+        dispatcher=dispatcher,
     )
 
 
@@ -130,7 +156,7 @@ async def get_current_user_session(
     credentials: Annotated[HTTPAuthorizationCredentials, Depends(bearer_scheme)],
 ) -> tuple[UserWithRoles, Session]:
     try:
-        return await service.load_current_user_session(credentials.credentials)
+        user, session = await service.load_current_user_session(credentials.credentials)
     except (
         InvalidCredentialsError,
         InvalidSessionError,
@@ -139,53 +165,110 @@ async def get_current_user_session(
     ) as e:
         raise AppHTTPException(status_code=401, detail=str(e)) from e
 
+    user_id_ctx.set(str(user.id))
+    return user, session
+
 
 async def get_user_compliance(
     user_session: Annotated[tuple[UserWithRoles, Session], Depends(get_current_user_session)],
 ) -> UserCompliance:
     user = user_session[0]
     return UserCompliance(
-        must_accept_terms=user.must_accept_terms, must_change_password=user.must_change_password
+        must_accept_terms=user.must_accept_terms,
+        must_change_password=user.must_change_password,
     )
 
 
-def _extract_bearer_token(authorization: str | None) -> str:
+def _extract_bearer_token(authorization: str | None) -> str | None:
     if not authorization:
-        raise WebSocketException(code=1008, reason="Missing Authorization header")
+        return None
+
     scheme, _, token = authorization.partition(" ")
+
     if scheme.lower() != "bearer" or not token:
-        raise WebSocketException(code=1008, reason="Invalid Authorization header")
-    return token
+        return None
+
+    return token.strip()
+
+
+def _extract_token_from_ws_subprotocols(subprotocols: str | None) -> str | None:
+    if not subprotocols:
+        return None
+
+    parts = [part.strip().strip('"') for part in subprotocols.split(",")]
+
+    for index, part in enumerate(parts):
+        if part.lower() == "access_token" and len(parts) > index + 1:
+            token = parts[index + 1].strip()
+            return token or None
+
+    return None
+
+
+def _extract_ws_access_token(ws: WebSocket) -> str:
+    subprotocol_header = ws.headers.get("sec-websocket-protocol")
+    token = _extract_token_from_ws_subprotocols(subprotocol_header)
+
+    if token:
+        _ws_auth_logger.debug(
+            "WS token extracted from subprotocol",
+            extra={"path": ws.url.path},
+        )
+        return token
+
+    token = _extract_bearer_token(ws.headers.get("authorization"))
+
+    if token:
+        _ws_auth_logger.debug(
+            "WS token extracted from Authorization header",
+            extra={"path": ws.url.path},
+        )
+        return token
+
+    _ws_auth_logger.warning(
+        "WS rejected: missing access token",
+        extra={
+            "path": ws.url.path,
+            "has_subprotocol_header": bool(subprotocol_header),
+            "has_authorization_header": bool(ws.headers.get("authorization")),
+        },
+    )
+    raise WebSocketException(
+        code=1008,
+        reason="Missing WebSocket access token",
+    )
 
 
 async def get_current_user_session_ws(
     ws: WebSocket,
     service: Annotated[AuthService, Depends(get_auth_service)],
 ) -> tuple[UserWithRoles, Session]:
-    # Extract from custom subprotocol "access_token, <token>" since browsers block auth headers
-    token = None
-    subprotocols = ws.headers.get("Sec-WebSocket-Protocol")
-    if subprotocols:
-        parts = [p.strip() for p in subprotocols.split(",")]
-        if "access_token" in parts:
-            idx = parts.index("access_token")
-            # The token should be the next part in the sequence
-            if len(parts) > idx + 1:
-                token = parts[idx + 1]
+    token = _extract_ws_access_token(ws)
 
-    # Fallback to standard Authorization header
-    if not token:
-        token = _extract_bearer_token(ws.headers.get("Authorization"))
-        
     try:
-        return await service.load_current_user_session(token)
+        user, session = await service.load_current_user_session(token)
     except (
         InvalidCredentialsError,
         InvalidSessionError,
         SessionNotFoundError,
         UserNotFoundError,
     ) as e:
+        _ws_auth_logger.warning(
+            "WS rejected: invalid token/session",
+            extra={
+                "path": ws.url.path,
+                "error_type": type(e).__name__,
+                "error": str(e),
+            },
+        )
         raise WebSocketException(code=1008, reason=str(e)) from e
+
+    user_id_ctx.set(str(user.id))
+    _ws_auth_logger.debug(
+        "WS session loaded",
+        extra={"path": ws.url.path, "user_id": str(user.id)},
+    )
+    return user, session
 
 
 async def get_user_permissions(
@@ -213,15 +296,18 @@ async def get_user_compliance_ws(
 ) -> UserCompliance:
     user = user_session[0]
     return UserCompliance(
-        must_accept_terms=user.must_accept_terms, must_change_password=user.must_change_password
+        must_accept_terms=user.must_accept_terms,
+        must_change_password=user.must_change_password,
     )
 
 
 def require_permission(permission_name: str) -> Any:
     async def checker(permissions: UserPermissionsDep) -> bool:
         names = [p.name for p in permissions]
+
         if permission_name not in names:
             raise AppHTTPException(status_code=403, detail="Insufficient permissions")
+
         return True
 
     return Depends(checker)
@@ -230,8 +316,14 @@ def require_permission(permission_name: str) -> Any:
 def require_permission_ws(permission_name: str) -> Any:
     async def checker(permissions: UserPermissionsWsDep) -> bool:
         names = [p.name for p in permissions]
+
         if permission_name not in names:
+            _ws_auth_logger.warning(
+                "WS rejected: insufficient permissions",
+                extra={"required": permission_name, "user_permissions": names},
+            )
             raise WebSocketException(code=1008, reason="Insufficient permissions")
+
         return True
 
     return Depends(checker)
@@ -240,17 +332,20 @@ def require_permission_ws(permission_name: str) -> Any:
 def require_user_compliance() -> Any:
     async def checker(compliance: Annotated[UserCompliance, Depends(get_user_compliance)]) -> bool:
         required_actions: list[str] = []
+
         if compliance.must_change_password:
             required_actions.append("change_password")
+
         if compliance.must_accept_terms:
             required_actions.append("accept_terms")
 
         if required_actions:
             raise AppHTTPException(
-                status_code=428,  # precondition required
+                status_code=428,
                 detail="Account setup required before accessing this resource.",
                 errors={"required_actions": required_actions},
             )
+
         return True
 
     return Depends(checker)
@@ -261,21 +356,21 @@ def require_user_compliance_ws() -> Any:
         compliance: Annotated[UserCompliance, Depends(get_user_compliance_ws)],
     ) -> bool:
         required_actions: list[str] = []
+
         if compliance.must_change_password:
             required_actions.append("change_password")
+
         if compliance.must_accept_terms:
             required_actions.append("accept_terms")
 
         if required_actions:
             raise WebSocketException(code=1008, reason="Account setup required")
+
         return True
 
     return Depends(checker_ws)
 
 
-# ============================================================
-# Type Aliases for Router Use
-# ============================================================
 RoleServiceDep = Annotated[RoleService, Depends(get_role_service)]
 RoleRepoDep = Annotated[RoleRepository, Depends(get_role_repository)]
 
@@ -285,6 +380,9 @@ PermissionRepoDep = Annotated[PermissionRepository, Depends(get_permission_repos
 UserServiceDep = Annotated[UserService, Depends(get_user_service)]
 UserRepositoryDep = Annotated[UserRepository, Depends(get_user_repository)]
 
+UserLevelServiceDep = Annotated[UserLevelService, Depends(get_user_level_service)]
+UserLevelRepositoryDep = Annotated[UserLevelRepository, Depends(get_user_level_repository)]
+
 SessionServiceDep = Annotated[SessionService, Depends(get_session_service)]
 SessionRepoDep = Annotated[SessionRepository, Depends(get_session_repository)]
 
@@ -292,7 +390,8 @@ AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 
 CurrentUserSessionDep = Annotated[tuple[UserWithRoles, Session], Depends(get_current_user_session)]
 CurrentUserSessionWsDep = Annotated[
-    tuple[UserWithRoles, Session], Depends(get_current_user_session_ws)
+    tuple[UserWithRoles, Session],
+    Depends(get_current_user_session_ws),
 ]
 
 PasswordServiceDep = Annotated[PasswordService, Depends(get_password_service)]

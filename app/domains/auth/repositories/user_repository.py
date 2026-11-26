@@ -12,10 +12,11 @@ from ..entities import Permission as PermissionEntity
 from ..entities import Role as RoleEntity
 from ..entities import User as UserEntity
 from ..entities import UserRole, UserWithRoles
+from ..models import Level as LevelModel
 from ..models import Permission as PermissionModel
 from ..models import Role as RoleModel
 from ..models import User as UserModel
-from ..models import role_permissions, user_roles
+from ..models import role_permissions, user_levels, user_roles
 from ..schemas import CreateUserDTO, ReplaceUserDTO, UpdateUserDTO
 
 
@@ -25,15 +26,24 @@ class UserRepository:
 
     @require_dto(CreateUserDTO)
     async def create(self, dto: CreateUserDTO) -> UserWithRoles:
-        insert_values = dto.model_dump(exclude={"role_ids"}, exclude_none=True)
+        insert_values = dto.model_dump(exclude={"role_ids", "level_ids"}, exclude_none=True)
         stmt = insert(UserModel).values(**insert_values).returning(UserModel)
         try:
             res = await self.db.execute(stmt)
             user = res.scalar_one()
-            if dto.role_ids:
-                role_rows = [{"user_id": user.id, "role_id": role_id} for role_id in dto.role_ids]
+            role_ids = list(dict.fromkeys(dto.role_ids))
+            level_ids = list(dict.fromkeys(dto.level_ids))
+
+            if role_ids:
+                role_rows = [{"user_id": user.id, "role_id": role_id} for role_id in role_ids]
 
                 await self.db.execute(insert(user_roles).values(role_rows))
+
+            if level_ids:
+                level_rows = [
+                    {"user_id": user.id, "level_id": level_id} for level_id in level_ids
+                ]
+                await self.db.execute(insert(user_levels).values(level_rows))
 
             await self.db.commit()
             await self.db.refresh(user, attribute_names=["roles"])
@@ -50,6 +60,12 @@ class UserRepository:
         result = await self.db.execute(select(UserModel))
         rows = result.scalars().all()
         return [self._to_entity(row) for row in rows]
+
+    async def get_all_with_roles(self) -> list[UserWithRoles]:
+        stmt = select(UserModel).options(selectinload(UserModel.roles))
+        result = await self.db.execute(stmt)
+        rows = result.scalars().all()
+        return [self._to_user_with_roles(row) for row in rows]
 
     async def get_by_id(self, id: UUID) -> UserEntity | None:
         stmt = select(UserModel).where(UserModel.id == id)
@@ -73,11 +89,27 @@ class UserRepository:
         rows = res.scalars().all()
         return [self._to_entity(row) for row in rows]
 
+    async def get_role_names_by_ids(self, role_ids: list[int]) -> set[str]:
+        if not role_ids:
+            return set()
+        stmt = select(RoleModel.name).where(RoleModel.id.in_(set(role_ids)))
+        result = await self.db.execute(stmt)
+        return set(result.scalars().all())
+
+    async def get_existing_level_ids(self, level_ids: list[int]) -> set[int]:
+        if not level_ids:
+            return set()
+        stmt = select(LevelModel.id).where(LevelModel.id.in_(set(level_ids)))
+        result = await self.db.execute(stmt)
+        return set(result.scalars().all())
+
     @require_dto(UpdateUserDTO, ReplaceUserDTO)
     async def update(self, id: UUID, dto: UpdateUserDTO | ReplaceUserDTO) -> UserEntity | None:
         update_values = None
         if isinstance(dto, ReplaceUserDTO):
-            update_values = dto.model_dump(exclude={"role_ids"}, exclude_none=False)
+            update_values = dto.model_dump(
+                exclude={"role_ids", "level_ids"}, exclude_none=False
+            )
         else:
             update_values = dto.model_dump(exclude_none=True)
 
@@ -135,21 +167,7 @@ class UserRepository:
         row = result.scalar_one_or_none()
         if row is None:
             return None
-        roles = [RoleEntity(id=r.id, name=r.name, description=r.description) for r in row.roles]
-        return UserWithRoles(
-            id=row.id,
-            email=row.email,
-            password_hash=row.password_hash,
-            username=row.username,
-            name=row.name,
-            oauth_provider=row.oauth_provider,
-            oauth_provider_id=row.oauth_provider_id,
-            is_active=row.is_active,
-            is_verified=row.is_verified,
-            must_change_password=row.must_change_password,
-            must_accept_terms=row.must_accept_terms,
-            roles=roles,
-        )
+        return self._to_user_with_roles(row)
 
     async def get_by_email_with_roles(self, email: str) -> UserWithRoles | None:
         stmt = (
@@ -159,25 +177,12 @@ class UserRepository:
         row = result.scalar_one_or_none()
         if row is None:
             return None
-        roles = [RoleEntity(id=r.id, name=r.name, description=r.description) for r in row.roles]
-        return UserWithRoles(
-            id=row.id,
-            email=row.email,
-            password_hash=row.password_hash,
-            username=row.username,
-            name=row.name,
-            oauth_provider=row.oauth_provider,
-            oauth_provider_id=row.oauth_provider_id,
-            is_active=row.is_active,
-            is_verified=row.is_verified,
-            must_change_password=row.must_change_password,
-            must_accept_terms=row.must_accept_terms,
-            roles=roles,
-        )
+        return self._to_user_with_roles(row)
 
     async def add_roles(
         self, id: UUID, role_ids: list[int]
     ) -> tuple[UserWithRoles | None, set[int] | None]:
+        role_ids = list(set(role_ids))
         if len(role_ids) == 0:
             return (None, None)
 
@@ -253,6 +258,52 @@ class UserRepository:
             PermissionEntity(id=p.id, name=p.name, description=p.description) for p in permissions
         ]
 
+    async def update_user_roles(
+        self, user_id: UUID, add_ids: list[int], remove_ids: list[int]
+    ) -> tuple[UserWithRoles | None, set[int] | None]:
+        add_ids = list(set(add_ids))
+        remove_ids = list(set(remove_ids))
+
+        user = await self.get_by_id(user_id)
+        if user is None:
+            return (None, None)
+
+        if add_ids:
+            roles_stmt = select(RoleModel.id).where(RoleModel.id.in_(add_ids))
+            result = await self.db.execute(roles_stmt)
+            found_ids = set(result.scalars().all())
+            missing_ids = set(add_ids) - found_ids
+            if missing_ids:
+                return (None, missing_ids)
+
+        try:
+            if remove_ids:
+                await self.db.execute(
+                    delete(user_roles).where(
+                        user_roles.c.user_id == user_id,
+                        user_roles.c.role_id.in_(remove_ids),
+                    )
+                )
+
+            if add_ids:
+                from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+                values: list[dict[str, UUID | int]] = [
+                    {"user_id": user_id, "role_id": role_id} for role_id in add_ids
+                ]
+                await self.db.execute(
+                    pg_insert(user_roles).values(values).on_conflict_do_nothing()
+                )
+
+            await self.db.commit()
+        except SQLAlchemyError:
+            await self.db.rollback()
+            raise
+
+        updated_user = await self.get_with_roles(user_id)
+        return (updated_user, None)
+
+
     async def user_exists(self, user_id: UUID) -> bool:
         stmt = select(exists().where(UserModel.id == user_id))
         result = await self.db.execute(stmt)
@@ -283,6 +334,46 @@ class UserRepository:
         await self.db.commit()
         return self._to_entity(row)
 
+    async def set_avatar(
+        self, user_id: UUID, new_avatar_file_id: UUID | None
+    ) -> tuple[UserWithRoles, UUID | None] | None:
+        """Set or clear the user's avatar_file_id.
+
+        Returns ``(user_with_roles, previous_avatar_file_id)`` on success
+        or ``None`` when the user does not exist. ``previous_avatar_file_id``
+        is ``None`` when the user had no avatar before.
+
+        Reads the previous value before issuing the UPDATE so the caller
+        knows which old ``file_objects`` row to soft-delete. Both reads
+        live in the same transaction.
+        """
+        select_stmt = (
+            select(UserModel)
+            .options(selectinload(UserModel.roles))
+            .where(UserModel.id == user_id)
+        )
+        current = (await self.db.execute(select_stmt)).scalar_one_or_none()
+        if current is None:
+            return None
+
+        previous_avatar_file_id = current.avatar_file_id
+
+        if previous_avatar_file_id == new_avatar_file_id:
+            # No-op write avoids a needless RETURNING round-trip; surface
+            # the same shape to the caller.
+            return self._to_user_with_roles(current), previous_avatar_file_id
+
+        update_stmt = (
+            update(UserModel)
+            .where(UserModel.id == user_id)
+            .values(avatar_file_id=new_avatar_file_id)
+            .returning(UserModel)
+        )
+        updated = (await self.db.execute(update_stmt)).scalar_one()
+        await self.db.commit()
+        await self.db.refresh(updated, attribute_names=["roles"])
+        return self._to_user_with_roles(updated), previous_avatar_file_id
+
     def _to_entity(self, model: UserModel) -> UserEntity:
         return UserEntity(
             id=model.id,
@@ -292,6 +383,8 @@ class UserRepository:
             name=model.name,
             oauth_provider=model.oauth_provider,
             oauth_provider_id=model.oauth_provider_id,
+            company_id=model.company_id,
+            avatar_file_id=model.avatar_file_id,
             is_active=model.is_active,
             is_verified=model.is_verified,
             must_change_password=model.must_change_password,
@@ -308,9 +401,27 @@ class UserRepository:
             name=model.name,
             oauth_provider=model.oauth_provider,
             oauth_provider_id=model.oauth_provider_id,
+            company_id=model.company_id,
+            avatar_file_id=model.avatar_file_id,
             is_active=model.is_active,
             is_verified=model.is_verified,
             must_change_password=model.must_change_password,
             must_accept_terms=model.must_accept_terms,
             roles=roles,
         )
+    async def accept_terms(self, user_id: UUID) -> UserEntity | None:
+        stmt = (
+            update(UserModel)
+            .where(UserModel.id == user_id)
+            .values(must_accept_terms=False)
+            .returning(UserModel)
+        )
+
+        res = await self.db.execute(stmt)
+        row = res.scalar_one_or_none()
+
+        if row is None:
+            return None
+
+        await self.db.commit()
+        return self._to_entity(row)

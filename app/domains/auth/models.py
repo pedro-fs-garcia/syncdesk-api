@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from datetime import datetime
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Index, Integer, String, Table, func
@@ -11,11 +14,27 @@ from app.db.postgres.base import Base
 
 from .enums import OAuthProvider, SessionStatus, TokenPurpose, enum_values
 
+if TYPE_CHECKING:
+    from app.domains.companies.models import Company
+
 user_roles = Table(
     "user_roles",
     Base.metadata,
     Column("user_id", PG_UUID(as_uuid=True), ForeignKey("users.id"), primary_key=True),
     Column("role_id", Integer, ForeignKey("roles.id"), primary_key=True),
+    Column("created_at", DateTime, nullable=False, server_default=func.now()),
+)
+
+user_levels = Table(
+    "user_levels",
+    Base.metadata,
+    Column(
+        "user_id",
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column("level_id", Integer, ForeignKey("levels.id", ondelete="CASCADE"), primary_key=True),
     Column("created_at", DateTime, nullable=False, server_default=func.now()),
 )
 
@@ -47,6 +66,15 @@ class User(Base):
         nullable=True,
     )
     oauth_provider_id: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True)
+    company_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("companies.id"), nullable=True, index=True
+    )
+    # Nullable FK to the FileObject backing the user's avatar. NULL means
+    # "no avatar". Updated via PUT /users/me/avatar; the previous file row
+    # is soft-deleted as part of the swap.
+    avatar_file_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("file_objects.id"), nullable=True
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
     is_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
     must_change_password: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -61,6 +89,9 @@ class User(Base):
         back_populates="user", cascade="all, delete-orphan"
     )
     roles: Mapped[list["Role"]] = relationship(secondary=user_roles, back_populates="users")
+    levels: Mapped[list["Level"]] = relationship(secondary=user_levels, back_populates="users")
+
+    company: Mapped["Company | None"] = relationship(back_populates="users")
 
     def __repr__(self) -> str:
         return f"<User(id={self.id}, name='{self.name}')>"
@@ -83,6 +114,18 @@ class Role(Base):
 
     def __repr__(self) -> str:
         return f"<Role(id={self.id}, name={self.name})>"
+
+
+class Level(Base):
+    __tablename__ = "levels"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(10), unique=True, nullable=False)
+
+    users: Mapped[list["User"]] = relationship(secondary=user_levels, back_populates="levels")
+
+    def __repr__(self) -> str:
+        return f"<Level(id={self.id}, name={self.name})>"
 
 
 class Permission(Base):

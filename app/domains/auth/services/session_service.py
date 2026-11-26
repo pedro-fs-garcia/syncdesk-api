@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.http.schemas import SessionDeviceInfo
+from app.core.logger import get_logger
 from app.core.security import JWTService
 from app.domains.auth.enums import SessionStatus
 from app.domains.auth.exceptions import SessionExpiredError, SessionNotFoundError
@@ -32,9 +33,10 @@ class SessionService:
         self.jwt_service = jwt_service
         self.repo = session_repo
         self.max_active_sessions = 5
+        self.logger = get_logger("app.auth.session_service")
 
     async def init_session(
-        self, user_id: UUID, role_names: list[str], device_info: SessionDeviceInfo | None = None
+        self, user_id: UUID, role_names: list[str], device_info: SessionDeviceInfo | None = None, company_id: UUID | None = None
     ) -> tuple[str, str]:
         session_dto = CreateSessionDTO(
             user_id=user_id,
@@ -44,20 +46,25 @@ class SessionService:
             device_info=device_info,
             last_used_at=_utcnow(),
         )
-        session, refresh_token = await self.create(session_dto)
-        access_token = self.jwt_service.create_access_token(user_id, role_names, session.id)
+        # Repassa o company_id para a criação do Refresh Token
+        session, refresh_token = await self.create(session_dto, company_id)
+        
+        # Repassa o company_id para a criação do Access Token
+        access_token = self.jwt_service.create_access_token(user_id, role_names, session.id, company_id)
 
         return access_token, refresh_token
 
-    async def create(self, dto: CreateSessionDTO) -> tuple[Session, str]:
+    async def create(self, dto: CreateSessionDTO, company_id: UUID | None = None) -> tuple[Session, str]:
         await self.repo.free_active_sessions_limit(dto.user_id, self.max_active_sessions)
         session_data = dto.model_dump(exclude={"role_names"}, exclude_none=True)
         if dto.device_info is not None:
             session_data["device_info"] = dto.device_info.model_dump(mode="json", exclude_none=True)
 
         session_model = await self.repo.add(SessionModel(**session_data))
+        
+        # Inclui o company_id na geração do token
         refresh_token = self.jwt_service.create_refresh_token(
-            session_model.user_id, dto.role_names, session_model.id
+            session_model.user_id, dto.role_names, session_model.id, company_id
         )
         refresh_token_hash = self.jwt_service.hash_token(refresh_token)
         session_model.refresh_token_hash = refresh_token_hash
@@ -107,6 +114,7 @@ class SessionService:
         self, session: Session, new_refresh_token_hash: str, time_delta: timedelta
     ) -> Session:
         if session.expires_at < _utcnow():
+            self.logger.warning("Refresh attempted on expired session", extra={"session_id": str(session.id)})
             raise SessionExpiredError("Session cannot be refreshed after expired.")
 
         update_dto = UpdateSessionDTO(
@@ -119,6 +127,7 @@ class SessionService:
             session.id, session.refresh_token_hash, update_dto
         )
         if updated_session is None:
+            self.logger.warning("Possible token reuse detected", extra={"session_id": str(session.id)})
             raise SessionNotFoundError(
                 "Session could not be refreshed. Token may have been reused."
             )
@@ -128,3 +137,7 @@ class SessionService:
         active_sessions = await self.repo.get_active_by_user_id(user_id)
         for session in active_sessions:
             await self.repo.revoke(session.id)
+        self.logger.info(
+            "All user sessions revoked",
+            extra={"user_id": str(user_id), "count": len(active_sessions)},
+        )
